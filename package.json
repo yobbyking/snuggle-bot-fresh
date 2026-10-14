@@ -1,0 +1,18 @@
+{
+  "name": "snuggle-bot",
+  "version": "2.0.0",
+  "description": "Snuggle X WhatsApp Bot — clean, working Baileys bot with fake contact card and channel forwarding",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.24",
+    "pino": "^9.0.0",
+    "better-sqlite3": "^11.0.0",
+    "axios": "^1.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
