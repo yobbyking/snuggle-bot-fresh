@@ -230,13 +230,16 @@ async function start() {
   });
   sock.ev.on('creds.update', saveCreds);
 
-  // Channel forwarding wrapper
+  // Channel forwarding wrapper — ONLY for groups, NOT DMs (DMs get silently dropped with contextInfo)
   const _origSend = sock.sendMessage.bind(sock);
   sock.sendMessage = async function(jid, content, opts = {}) {
-    // Add channel forwarding to text/image/video/audio messages (skip react, delete, sticker, contacts, poll)
     if (content && typeof content === 'object' && !content.react && !content.delete && !content.sticker && !content.contacts && !content.poll) {
-      if (!content.contextInfo) content.contextInfo = {};
-      if (!content.contextInfo.forwardedNewsletterMessageInfo) Object.assign(content.contextInfo, getChannelContext());
+      // Only add channel forwarding for GROUP messages, not DMs
+      const isGroupSend = jid && jid.endsWith('@g.us');
+      if (isGroupSend) {
+        if (!content.contextInfo) content.contextInfo = {};
+        if (!content.contextInfo.forwardedNewsletterMessageInfo) Object.assign(content.contextInfo, getChannelContext());
+      }
     }
     return _origSend(jid, content, opts);
   };
@@ -306,11 +309,27 @@ async function start() {
       if (mode === 'groups' && !isGroup && !ownerCheck && !sudoCheck) return;
       if (mode === 'dms' && isGroup && !ownerCheck && !sudoCheck) return;
 
-      // === PUBLIC ===
+      // === LOADING ANIMATION for .menu ===
+      async function showLoading(chatId) {
+        try {
+          const lm = await _origSend(chatId, { text: '*Loading* •' });
+          const stages = ['*Loading* ••','*Loading* • •','*Loading* • • •','*Loading* • • • •'];
+          for (const s of stages) { await new Promise(r => setTimeout(r, 400)); try { await _origSend(chatId, { text: s, edit: lm.key }); } catch {} }
+          await new Promise(r => setTimeout(r, 400));
+        } catch (e) { console.error('[Loading]', e.message); }
+      }
+
+      // === CONVERSATION-AWARE CHATBOT ===
+      const chatHistory = new Map();
+      function getChatHistory(jid) { if (!chatHistory.has(jid)) chatHistory.set(jid, []); return chatHistory.get(jid); }
+      function addToHistory(jid, role, text) { const h = getChatHistory(jid); h.push({ role, parts: [{ text }] }); if (h.length > 20) h.shift(); }
+
+      // === PUBLIC COMMANDS ===
       if (isMenuCmd) {
+        await showLoading(chatId);
         const menuText = buildMenu(prefix, getOwnerName(), mode);
         try { await sock.sendMessage(chatId, { text: menuText }); console.log(`[MENU] ✅ ${chatId}`); }
-        catch (e) { console.error('[MENU]', e.message); try { await sock.sendMessage(chatId, { text: menuText }); } catch {} }
+        catch (e) { console.error('[MENU]', e.message); try { await _origSend(chatId, { text: menuText }); } catch {} }
         return;
       }
       if (cmd === `${prefix}all` || (prefix && lower === 'all')) { await sock.sendMessage(chatId, { text: buildMenu(prefix, getOwnerName(), mode) }, { quoted: quotedMsg }); return; }
@@ -321,8 +340,28 @@ async function start() {
       if (cmd === `${prefix}repo`) { await sock.sendMessage(chatId, { text: `📦 GitHub: ${GITHUB_URL}` }, { quoted: quotedMsg }); return; }
       if (cmd === `${prefix}uptime`) { await sock.sendMessage(chatId, { text: `⏱️ ${formatUptime(process.uptime())}` }, { quoted: quotedMsg }); return; }
       if (cmd === `${prefix}time`) { await sock.sendMessage(chatId, { text: `🕐 ${new Date().toLocaleString()}` }, { quoted: quotedMsg }); return; }
+      if (cmd === `${prefix}whoami`) { await sock.sendMessage(chatId, { text: `*You are* ${m.pushName || 'User'}\n*Number:* ${senderPhone}\n*Status:* ${ownerCheck ? 'Owner 👑' : sudoCheck ? 'Sudo 🔑' : 'User'}` }, { quoted: quotedMsg }); return; }
 
-      // Sticker
+      // === CONVERSATION-AWARE CHATBOT (auto-reply in DMs) ===
+      const chatbotOn = dbGet('chatbot', '0') === '1';
+      if (chatbotOn && !isGroup && !cmd.startsWith(prefix) && !cmd.startsWith('.') && !cmd.startsWith('!') && !cmd.startsWith('/')) {
+        const key = getGeminiKey();
+        if (key) {
+          try {
+            await sock.sendPresenceUpdate('composing', chatId);
+            addToHistory(chatId, 'user', raw);
+            const res = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, {
+              contents: getChatHistory(chatId),
+              systemInstruction: { parts: [{ text: `You are Snuggle X, a helpful WhatsApp bot assistant. Be friendly and concise. Owner: ${getOwnerName()}.` }] },
+            }, { timeout: 30000, headers: { 'Content-Type': 'application/json' } });
+            const aiText = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (aiText) { addToHistory(chatId, 'model', aiText.trim()); await sock.sendMessage(chatId, { text: aiText.trim() }); }
+          } catch (e) { console.error('[CHATBOT]', e.message); }
+          return;
+        }
+      }
+
+      // === STICKER (public) ===
       if (cmd === `${prefix}sticker`) {
         let hasMedia = msg.imageMessage || msg.videoMessage || msg.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage;
         if (!hasMedia) { await sock.sendMessage(chatId, { text: 'Send/reply to image with .sticker' }, { quoted: quotedMsg }); return; }
@@ -335,68 +374,129 @@ async function start() {
         return;
       }
 
+      // === URL (public) ===
+      if (cmd === `${prefix}url`) {
+        let hasMedia = msg.imageMessage || msg.videoMessage || msg.audioMessage || msg.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage;
+        if (!hasMedia) { await sock.sendMessage(chatId, { text: 'Send/reply to media with .url' }, { quoted: quotedMsg }); return; }
+        try {
+          let tm = m; if (!msg.imageMessage && !msg.videoMessage && !msg.audioMessage) { const q = msg.extendedTextMessage.contextInfo.quotedMessage; tm = { key: { remoteJid: chatId, id: msg.extendedTextMessage.contextInfo.stanzaId, participant: msg.extendedTextMessage.contextInfo.participant }, message: q }; }
+          const buf = await downloadMediaMessage(tm, 'buffer', {}, { logger: P({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
+          const FormData = require('form-data'); const form = new FormData(); form.append('file', Buffer.from(buf), 'upload.bin');
+          const res = await axios.post('https://tmpfiles.org/api/v1/upload', form, { headers: form.getHeaders(), timeout: 60000 });
+          const url = res.data?.data?.url?.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+          await sock.sendMessage(chatId, { text: `✅ *URL:*\n${url}` }, { quoted: quotedMsg });
+        } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); }
+        return;
+      }
+
       // === ACCESS GATE ===
       if (!ownerCheck && !sudoCheck) {
         if (cmd.startsWith(prefix)) await sock.sendMessage(chatId, { text: `> *only sudo access 🚫*\n> Get yours 0181163563 ✅` }, { quoted: quotedMsg });
         return;
       }
 
-      // === OWNER/SUDO ===
+      // Helper: toggle anti feature
+      async function toggleAnti(key, label) {
+        if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); return; }
+        const s = dbGetJSON('settings', {}); const gs = s[chatId] || {};
+        const sub = args[0]?.toLowerCase();
+        if (sub === 'delete' && args[1] === 'on') { gs[key] = 'delete'; s[chatId] = gs; dbSet('settings', JSON.stringify(s)); await sock.sendMessage(chatId, { text: `✅ Anti-${label}: DELETE` }, { quoted: quotedMsg }); }
+        else if (sub === 'warn' && args[1] === 'on') { gs[key] = 'warn'; s[chatId] = gs; dbSet('settings', JSON.stringify(s)); await sock.sendMessage(chatId, { text: `✅ Anti-${label}: WARN` }, { quoted: quotedMsg }); }
+        else if (sub === 'kick' && args[1] === 'on') { gs[key] = 'kick'; s[chatId] = gs; dbSet('settings', JSON.stringify(s)); await sock.sendMessage(chatId, { text: `✅ Anti-${label}: KICK` }, { quoted: quotedMsg }); }
+        else if (sub === 'on') { gs[key] = 'delete'; s[chatId] = gs; dbSet('settings', JSON.stringify(s)); await sock.sendMessage(chatId, { text: `✅ Anti-${label} ON (delete)` }, { quoted: quotedMsg }); }
+        else if (sub === 'off') { gs[key] = 'off'; s[chatId] = gs; dbSet('settings', JSON.stringify(s)); await sock.sendMessage(chatId, { text: `❌ Anti-${label} OFF` }, { quoted: quotedMsg }); }
+        else { await sock.sendMessage(chatId, { text: `*Anti-${label}:* ${gs[key] || 'off'}\n\nUsage: .${key} delete/warn/kick on\n.${key} off` }, { quoted: quotedMsg }); }
+      }
+
+      // === ALL COMMANDS ===
       switch (cmd) {
         case `${prefix}mode`:
-          if (['private','public','silent','groups','dms'].includes(argText)) {
-            if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; }
-            dbSet('mode', argText); await sock.sendMessage(chatId, { text: `*MODE* ✅ → *${argText}*` }, { quoted: quotedMsg });
-          } else { await sock.sendMessage(chatId, { text: `*Mode:* ${mode}\n*Prefix:* ${prefix}\n\nUsage: .mode public/private/silent/groups/dms` }, { quoted: quotedMsg }); }
-          break;
-        case `${prefix}setprefix`:
-          if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; }
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setprefix <prefix>' }, { quoted: quotedMsg }); break; }
-          dbSet('prefix', argText === 'none' ? 'none' : argText); await sock.sendMessage(chatId, { text: `✅ Prefix: ${argText}` }, { quoted: quotedMsg }); break;
-        case `${prefix}setownername`:
-          if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; }
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setownername <name>' }, { quoted: quotedMsg }); break; }
-          dbSet('ownerName', argText); ownerName = argText; await sock.sendMessage(chatId, { text: `✅ Owner: ${argText}` }, { quoted: quotedMsg }); break;
-        case `${prefix}addsudo`:
-          if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; }
-          const sn = args[0]?.replace(/[^0-9]/g, ''); if (!sn) { await sock.sendMessage(chatId, { text: 'Usage: .addsudo <number>' }, { quoted: quotedMsg }); break; }
-          db.prepare('INSERT OR IGNORE INTO sudos (number) VALUES (?)').run(sn); await sock.sendMessage(chatId, { text: `✅ Sudo: ${sn}` }, { quoted: quotedMsg }); break;
-        case `${prefix}sudolist`:
-          const sudos = db.prepare('SELECT number FROM sudos').all().map(r => r.number);
-          await sock.sendMessage(chatId, { text: `*Sudo (${sudos.length}):*\n${sudos.length ? sudos.map(x => '• ' + x).join('\n') : 'None'}` }, { quoted: quotedMsg }); break;
-        case `${prefix}tagall`:
-          if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; }
-          try { const meta = await sock.groupMetadata(chatId); const mentions = meta.participants.map(p => p.id); await sock.sendMessage(chatId, { text: `┏▣ *TAG ALL* ▣\n┗▣ ${mentions.length} members\n\n` + mentions.map(p => '➽ @' + p.split('@')[0]).join('\n'), mentions }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
-        case `${prefix}song`:
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .song <name>' }, { quoted: quotedMsg }); break; }
-          await sock.sendMessage(chatId, { text: `🎵 Searching: ${argText}...` }, { quoted: quotedMsg });
-          try { const { spawnSync } = require('child_process'); const tf = `/tmp/song-${Date.now()}.mp3`; const r = spawnSync('yt-dlp', ['--no-playlist','--no-warnings','--retries','3','--extract-audio','--audio-format','mp3','--audio-quality','0','-o',tf,`ytsearch1:${argText.replace(/"/g,'')}`], { timeout: 180000, encoding: 'utf-8', maxBuffer: 20*1024*1024 }); if (r.status !== 0 || !fs.existsSync(tf)) throw new Error('Download failed'); const b = fs.readFileSync(tf); const tm = (r.stdout||'').match(/\[info\] \w+: (.+)/); const t = tm ? tm[1].split(' [')[0].trim() : argText; await sock.sendMessage(chatId, { audio: b, mimetype: 'audio/mpeg', fileName: `${t}.mp3`, caption: `🎵 *${t}*` }, { quoted: quotedMsg }); fs.unlinkSync(tf); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
-        case `${prefix}video`:
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .video <name>' }, { quoted: quotedMsg }); break; }
-          await sock.sendMessage(chatId, { text: `🎬 Searching: ${argText}...` }, { quoted: quotedMsg });
-          try { const { spawnSync } = require('child_process'); const tf = `/tmp/vid-${Date.now()}.mp4`; const r = spawnSync('yt-dlp', ['--no-playlist','--no-warnings','--retries','3','-f','best[ext=mp4][filesize<60M]/best[ext=mp4]/best','--merge-output-format','mp4','-o',tf,`ytsearch1:${argText.replace(/"/g,'')}`], { timeout: 240000, encoding: 'utf-8', maxBuffer: 20*1024*1024 }); if (r.status !== 0 || !fs.existsSync(tf)) throw new Error('Download failed'); const b = fs.readFileSync(tf); if (b.length > 60*1024*1024) { fs.unlinkSync(tf); throw new Error('Too large'); } const tm = (r.stdout||'').match(/\[info\] \w+: (.+)/); const t = tm ? tm[1].split(' [')[0].trim() : argText; await sock.sendMessage(chatId, { video: b, mimetype: 'video/mp4', fileName: `${t}.mp4`, caption: `🎬 *${t}*\n_${(b.length/1024/1024).toFixed(1)} MB_` }, { quoted: quotedMsg }); fs.unlinkSync(tf); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
-        case `${prefix}ai`:
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .ai <question>' }, { quoted: quotedMsg }); break; }
-          try { const key = getGeminiKey(); if (!key) { await sock.sendMessage(chatId, { text: '❌ Set .setgeminikey <key>' }, { quoted: quotedMsg }); break; } const res = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, { contents: [{ parts: [{ text: `You are Snuggle X. Reply concisely. User: ${argText}` }] }] }, { timeout: 30000, headers: { 'Content-Type': 'application/json' } }); const ai = res.data?.candidates?.[0]?.content?.parts?.[0]?.text; await sock.sendMessage(chatId, { text: ai?.trim() || '❌ No response' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
-        case `${prefix}setgeminikey`:
-          if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; }
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setgeminikey <key>' }, { quoted: quotedMsg }); break; }
-          dbSet('geminiKey', argText.trim()); await sock.sendMessage(chatId, { text: '✅ Key set' }, { quoted: quotedMsg }); break;
-        case `${prefix}calc`:
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .calc <expr>' }, { quoted: quotedMsg }); break; }
-          try { const s = argText.replace(/[^0-9+\-*/().%\s]/g, ''); if (!s) throw 0; const r = Function('"use strict";return(' + s + ')')(); await sock.sendMessage(chatId, { text: `🔢 ${argText} = *${r}*` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '❌ Invalid' }, { quoted: quotedMsg }); } break;
-        case `${prefix}qr`:
-          if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .qr <text>' }, { quoted: quotedMsg }); break; }
-          try { const r = await axios.get(`https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(argText)}`, { responseType: 'arraybuffer', timeout: 15000 }); await sock.sendMessage(chatId, { image: Buffer.from(r.data), caption: '📱 QR' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+          if (['private','public','silent','groups','dms'].includes(argText)) { if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } dbSet('mode', argText); await sock.sendMessage(chatId, { text: `*MODE* ✅ → *${argText}*` }, { quoted: quotedMsg }); }
+          else { await sock.sendMessage(chatId, { text: `*Mode:* ${mode}\n*Prefix:* ${prefix}\n\nUsage: .mode public/private/silent/groups/dms` }, { quoted: quotedMsg }); } break;
+        case `${prefix}setprefix`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setprefix <prefix>' }, { quoted: quotedMsg }); break; } dbSet('prefix', argText === 'none' ? 'none' : argText); await sock.sendMessage(chatId, { text: `✅ Prefix: ${argText}` }, { quoted: quotedMsg }); break;
+        case `${prefix}setownername`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setownername <name>' }, { quoted: quotedMsg }); break; } dbSet('ownerName', argText); ownerName = argText; await sock.sendMessage(chatId, { text: `✅ Owner: ${argText}` }, { quoted: quotedMsg }); break;
+        case `${prefix}addsudo`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const sn = args[0]?.replace(/[^0-9]/g, ''); if (!sn) { await sock.sendMessage(chatId, { text: 'Usage: .addsudo <number>' }, { quoted: quotedMsg }); break; } db.prepare('INSERT OR IGNORE INTO sudos (number) VALUES (?)').run(sn); await sock.sendMessage(chatId, { text: `✅ Sudo: ${sn}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}delsudo`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const dn = args[0]?.replace(/[^0-9]/g, ''); if (!dn) { await sock.sendMessage(chatId, { text: 'Usage: .delsudo <number>' }, { quoted: quotedMsg }); break; } db.prepare('DELETE FROM sudos WHERE number=?').run(dn); await sock.sendMessage(chatId, { text: `✅ Removed ${dn}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}sudolist`: { const sudos = db.prepare('SELECT number FROM sudos').all().map(r => r.number); await sock.sendMessage(chatId, { text: `*Sudo (${sudos.length}):*\n${sudos.length ? sudos.map(x => '• ' + x).join('\n') : 'None'}` }, { quoted: quotedMsg }); } break;
+        // GROUP
+        case `${prefix}tagall`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } try { const meta = await sock.groupMetadata(chatId); const mentions = meta.participants.map(p => p.id); await sock.sendMessage(chatId, { text: `┏▣ *TAG ALL* ▣\n┗▣ ${mentions.length} members\n\n` + mentions.map(p => '➽ @' + p.split('@')[0]).join('\n'), mentions }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}hidetag`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } try { const meta = await sock.groupMetadata(chatId); const mentions = meta.participants.map(p => p.id); await sock.sendMessage(chatId, { text: argText || '👥', mentions }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}promote`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } { const t = m.message.extendedTextMessage?.contextInfo?.mentionedJid?.[0]; if (!t) { await sock.sendMessage(chatId, { text: 'Mention a user' }, { quoted: quotedMsg }); break; } try { await sock.groupParticipantsUpdate(chatId, [t], 'promote'); await sock.sendMessage(chatId, { text: `✅ Promoted @${t.split('@')[0]}`, mentions: [t] }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } } break;
+        case `${prefix}demote`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } { const t = m.message.extendedTextMessage?.contextInfo?.mentionedJid?.[0]; if (!t) { await sock.sendMessage(chatId, { text: 'Mention a user' }, { quoted: quotedMsg }); break; } try { await sock.groupParticipantsUpdate(chatId, [t], 'demote'); await sock.sendMessage(chatId, { text: `✅ Demoted @${t.split('@')[0]}`, mentions: [t] }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } } break;
+        case `${prefix}kick`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } { const t = m.message.extendedTextMessage?.contextInfo?.mentionedJid?.[0]; if (!t) { await sock.sendMessage(chatId, { text: 'Mention a user' }, { quoted: quotedMsg }); break; } try { await sock.groupParticipantsUpdate(chatId, [t], 'remove'); await sock.sendMessage(chatId, { text: `✅ Kicked @${t.split('@')[0]}`, mentions: [t] }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } } break;
+        case `${prefix}add`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } { const n = args[0]?.replace(/[^0-9]/g, ''); if (!n) { await sock.sendMessage(chatId, { text: 'Usage: .add <number>' }, { quoted: quotedMsg }); break; } try { await sock.groupParticipantsUpdate(chatId, [`${n}@s.whatsapp.net`], 'add'); await sock.sendMessage(chatId, { text: `✅ Added ${n}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } } break;
+        case `${prefix}ginfo`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } try { const meta = await sock.groupMetadata(chatId); await sock.sendMessage(chatId, { text: `📋 *Group Info*\n\n*Name:* ${meta.subject}\n*Members:* ${meta.participants.length}\n*Admins:* ${meta.participants.filter(p => p.admin).length}\n*Created:* ${new Date(meta.creation * 1000).toLocaleDateString()}\n*Desc:* ${meta.desc || 'None'}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}link`: case `${prefix}grouplink`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } try { const c = await sock.groupInviteCode(chatId); await sock.sendMessage(chatId, { text: `🔗 https://chat.whatsapp.com/${c}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}resetlink`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } try { await sock.groupRevokeInvite(chatId); await sock.sendMessage(chatId, { text: '✅ Link reset' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}setgroupname`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setgroupname <name>' }, { quoted: quotedMsg }); break; } try { await sock.groupUpdateSubject(chatId, argText); await sock.sendMessage(chatId, { text: `✅ Name: ${argText}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}setdesc`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setdesc <desc>' }, { quoted: quotedMsg }); break; } try { await sock.groupUpdateDescription(chatId, argText); await sock.sendMessage(chatId, { text: '✅ Desc updated' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}leave`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } await sock.sendMessage(chatId, { text: '👋 Goodbye!' }, { quoted: quotedMsg }); await sock.groupLeave(chatId); break;
+        case `${prefix}join`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const l = args[0]; if (!l || !l.includes('chat.whatsapp.com')) { await sock.sendMessage(chatId, { text: 'Usage: .join <link>' }, { quoted: quotedMsg }); break; } try { await sock.groupAcceptInvite(l.split('/').pop()); await sock.sendMessage(chatId, { text: '✅ Joined' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } } break;
+        case `${prefix}getpp`: { const t = m.message.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || (isGroup ? m.key.participant : chatId); if (!t) { await sock.sendMessage(chatId, { text: 'Mention/reply to user' }, { quoted: quotedMsg }); break; } try { const u = await sock.profilePictureUrl(t, 'image'); const r = await axios.get(u, { responseType: 'arraybuffer', timeout: 15000 }); await sock.sendMessage(chatId, { image: Buffer.from(r.data), caption: `📸 ${t.split('@')[0]}` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '❌ No profile pic' }, { quoted: quotedMsg }); } } break;
+        case `${prefix}totalmembers`: if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; } try { const meta = await sock.groupMetadata(chatId); await sock.sendMessage(chatId, { text: `👥 *${meta.participants.length} members*` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        // ANTI
+        case `${prefix}antilink`: await toggleAnti('antilink', 'link'); break;
+        case `${prefix}antispam`: await toggleAnti('antispam', 'spam'); break;
+        case `${prefix}antibadword`: await toggleAnti('antibadword', 'badword'); break;
+        case `${prefix}antidelete`: await toggleAnti('antidelete', 'delete'); break;
+        case `${prefix}antimention`: await toggleAnti('antimention', 'mention'); break;
+        case `${prefix}antitag`: await toggleAnti('antitag', 'tag'); break;
+        case `${prefix}antisticker`: await toggleAnti('antisticker', 'sticker'); break;
+        case `${prefix}anticall`: { const on = argText === 'on'; dbSet('anticall', on ? '1' : '0'); await sock.sendMessage(chatId, { text: `${on ? '✅' : '❌'} Anti-call ${on ? 'ON' : 'OFF'}` }, { quoted: quotedMsg }); } break;
+        // DOWNLOAD
+        case `${prefix}song`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .song <name>' }, { quoted: quotedMsg }); break; } await sock.sendMessage(chatId, { text: `🎵 Searching: ${argText}...` }, { quoted: quotedMsg }); try { const { spawnSync } = require('child_process'); const tf = `/tmp/song-${Date.now()}.mp3`; const r = spawnSync('yt-dlp', ['--no-playlist','--no-warnings','--retries','3','--extract-audio','--audio-format','mp3','--audio-quality','0','-o',tf,`ytsearch1:${argText.replace(/["']/g,'')}`], { timeout: 180000, encoding: 'utf-8', maxBuffer: 20*1024*1024 }); if (r.status !== 0 || !fs.existsSync(tf)) { const err = (r.stderr||r.stdout||'').split('\n').filter(l=>l.includes('ERROR')).join(' ').slice(0,200); throw new Error(err || 'Download failed — try different song'); } const b = fs.readFileSync(tf); const tm = (r.stdout||'').match(/\[info\] \w+: (.+)/); const t = tm ? tm[1].split(' [')[0].trim() : argText; await sock.sendMessage(chatId, { audio: b, mimetype: 'audio/mpeg', fileName: `${t}.mp3`, caption: `🎵 *${t}*` }, { quoted: quotedMsg }); fs.unlinkSync(tf); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}video`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .video <name>' }, { quoted: quotedMsg }); break; } await sock.sendMessage(chatId, { text: `🎬 Searching: ${argText}...` }, { quoted: quotedMsg }); try { const { spawnSync } = require('child_process'); const tf = `/tmp/vid-${Date.now()}.mp4`; const r = spawnSync('yt-dlp', ['--no-playlist','--no-warnings','--retries','3','-f','best[ext=mp4][filesize<60M]/best[ext=mp4]/best','--merge-output-format','mp4','-o',tf,`ytsearch1:${argText.replace(/["']/g,'')}`], { timeout: 240000, encoding: 'utf-8', maxBuffer: 20*1024*1024 }); if (r.status !== 0 || !fs.existsSync(tf)) { const err = (r.stderr||r.stdout||'').split('\n').filter(l=>l.includes('ERROR')).join(' ').slice(0,200); throw new Error(err || 'Download failed — try different video'); } const b = fs.readFileSync(tf); if (b.length > 60*1024*1024) { fs.unlinkSync(tf); throw new Error('Too large (>60MB)'); } const tm = (r.stdout||'').match(/\[info\] \w+: (.+)/); const t = tm ? tm[1].split(' [')[0].trim() : argText; await sock.sendMessage(chatId, { video: b, mimetype: 'video/mp4', fileName: `${t}.mp4`, caption: `🎬 *${t}*\n_${(b.length/1024/1024).toFixed(1)} MB_` }, { quoted: quotedMsg }); fs.unlinkSync(tf); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        // MEDIA
+        case `${prefix}tts`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .tts <text>' }, { quoted: quotedMsg }); break; } try { const r = await axios.get(`https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(argText)}&tl=en&client=tw-ob`, { responseType: 'arraybuffer', timeout: 15000 }); await sock.sendMessage(chatId, { audio: Buffer.from(r.data), mimetype: 'audio/mpeg' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}translate`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .translate <text>' }, { quoted: quotedMsg }); break; } try { const r = await axios.get(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(argText)}`, { timeout: 10000 }); await sock.sendMessage(chatId, { text: `🌐 ${r.data[0].map(t=>t[0]).join('')}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}vv`: case `${prefix}vv2`: case `${prefix}vv3`: { if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } const q = msg.extendedTextMessage?.contextInfo?.quotedMessage; if (!q) { await sock.sendMessage(chatId, { text: 'Reply to view-once media' }, { quoted: quotedMsg }); break; } try { const tm = { key: { remoteJid: chatId, id: msg.extendedTextMessage.contextInfo.stanzaId, participant: msg.extendedTextMessage.contextInfo.participant, fromMe: msg.extendedTextMessage.contextInfo.fromMe || false }, message: q }; const buf = await downloadMediaMessage(tm, 'buffer', {}, { logger: P({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }); const b = Buffer.from(buf); let mt = 'image', mm = 'image/jpeg'; if (q.videoMessage) { mt = 'video'; mm = q.videoMessage.mimetype || 'video/mp4'; } else if (q.audioMessage) { mt = 'audio'; mm = q.audioMessage.mimetype || 'audio/mpeg'; } if (mt === 'video') await sock.sendMessage(chatId, { video: b, mimetype: mm, caption: '🔓 Unlocked' }, { quoted: quotedMsg }); else if (mt === 'audio') await sock.sendMessage(chatId, { audio: b, mimetype: mm }, { quoted: quotedMsg }); else await sock.sendMessage(chatId, { image: b, mimetype: mm, caption: '🔓 Unlocked' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } } break;
+        // FUN
         case `${prefix}8ball`: { const a = ['It is certain.','Without a doubt.','Yes.','Most likely.','Ask again later.','No.','Very doubtful.']; await sock.sendMessage(chatId, { text: `🎱 ${a[Math.floor(Math.random()*a.length)]}` }, { quoted: quotedMsg }); break; }
-        case `${prefix}flip`: { await sock.sendMessage(chatId, { text: `🪙 ${Math.random()<0.5?'Heads':'Tails'}` }, { quoted: quotedMsg }); break; }
-        case `${prefix}block`:
-          if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; }
-          const bt = args[0]?.replace(/[^0-9]/g, '') + '@s.whatsapp.net'; try { await sock.updateBlockStatus(bt, 'block'); await sock.sendMessage(chatId, { text: `✅ Blocked ${bt.split('@')[0]}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
-        case `${prefix}link`:
-          if (!isGroup) { await sock.sendMessage(chatId, { text: 'Group only' }, { quoted: quotedMsg }); break; }
-          try { const c = await sock.groupInviteCode(chatId); await sock.sendMessage(chatId, { text: `🔗 https://chat.whatsapp.com/${c}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}truth`: { const t = ['What is your biggest fear?','Most embarrassing moment?','Biggest secret?','Who is your crush?']; await sock.sendMessage(chatId, { text: `🤔 *Truth:* ${t[Math.floor(Math.random()*t.length)]}` }, { quoted: quotedMsg }); break; }
+        case `${prefix}dare`: { const d = ['Send a voice note singing.','Send your last screenshot.','Text first contact "I love you".']; await sock.sendMessage(chatId, { text: `😈 *Dare:* ${d[Math.floor(Math.random()*d.length)]}` }, { quoted: quotedMsg }); break; }
+        case `${prefix}joke`: try { const r = await axios.get('https://v2.jokeapi.dev/joke/Any?safe-mode&type=single', { timeout: 10000 }); await sock.sendMessage(chatId, { text: `😂 ${r.data.joke}` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '😂 Why dont programmers like nature? Too many bugs.' }, { quoted: quotedMsg }); } break;
+        case `${prefix}quote`: try { const r = await axios.get('https://api.quotable.io/random', { timeout: 10000 }); await sock.sendMessage(chatId, { text: `💬 *${r.data.content}*\n\n— ${r.data.author}` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '💬 *The only way to do great work is to love what you do.*\n\n— Steve Jobs' }, { quoted: quotedMsg }); } break;
+        case `${prefix}fact`: { const f = ['Honey never spoils.','A group of flamingos is called a flamboyance.','The shortest war lasted 38 minutes.','Octopuses have three hearts.']; await sock.sendMessage(chatId, { text: `🧠 *Did you know?* ${f[Math.floor(Math.random()*f.length)]}` }, { quoted: quotedMsg }); break; }
+        case `${prefix}pickupline`: { const l = ['Are you a magician? Everyone else disappears when I look at you.','Are you Wi-Fi? Because Im feeling a connection.','Is your name Google? You have everything Ive been searching for.']; await sock.sendMessage(chatId, { text: `😏 ${l[Math.floor(Math.random()*l.length)]}` }, { quoted: quotedMsg }); break; }
+        case `${prefix}rps`: { const c = ['rock','paper','scissors']; const bc = c[Math.floor(Math.random()*3)]; const uc = args[0]?.toLowerCase(); if (!uc || !c.includes(uc)) { await sock.sendMessage(chatId, { text: 'Usage: .rps <rock|paper|scissors>' }, { quoted: quotedMsg }); break; } const r = uc === bc ? 'Tie! 🤝' : ((uc==='rock'&&bc==='scissors')||(uc==='paper'&&bc==='rock')||(uc==='scissors'&&bc==='paper')) ? 'You win! 🎉' : 'I win! 🤖'; await sock.sendMessage(chatId, { text: `🪨📄✂️\n\nYou: ${uc}\nBot: ${bc}\n\n${r}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}ship`: { const u1 = args[0] || 'Romeo'; const u2 = args[1] || 'Juliet'; const p = Math.floor(Math.random()*100); await sock.sendMessage(chatId, { text: `💞 *Ship*\n\n${u1} ❤️ ${u2}\n\nCompatibility: ${p}% ${p>80?'💕':p>50?'💖':p>30?'💔':'❌'}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}flip`: await sock.sendMessage(chatId, { text: `🪙 ${Math.random()<0.5?'Heads':'Tails'}` }, { quoted: quotedMsg }); break;
+        case `${prefix}dice`: { const s = parseInt(args[0])||6; await sock.sendMessage(chatId, { text: `🎲 You rolled: ${Math.floor(Math.random()*s)+1} (d${s})` }, { quoted: quotedMsg }); } break;
+        case `${prefix}choose`: { const o = argText.split(',').map(x=>x.trim()).filter(x=>x); if (o.length<2) { await sock.sendMessage(chatId, { text: 'Usage: .choose a, b, c' }, { quoted: quotedMsg }); break; } await sock.sendMessage(chatId, { text: `🤔 I choose: *${o[Math.floor(Math.random()*o.length)]}*` }, { quoted: quotedMsg }); } break;
+        case `${prefix}shrug`: await sock.sendMessage(chatId, { text: '¯\\_(ツ)_/¯' }, { quoted: quotedMsg }); break;
+        // SEARCH
+        case `${prefix}weather`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .weather <city>' }, { quoted: quotedMsg }); break; } try { const r = await axios.get(`https://wttr.in/${encodeURIComponent(argText)}?format=3`, { timeout: 10000 }); await sock.sendMessage(chatId, { text: `🌤️ ${r.data}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}wiki`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .wiki <query>' }, { quoted: quotedMsg }); break; } try { const r = await axios.get(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(argText)}`, { timeout: 10000 }); await sock.sendMessage(chatId, { text: `📖 *${r.data.title}*\n\n${r.data.extract}` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '❌ Not found' }, { quoted: quotedMsg }); } break;
+        case `${prefix}define`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .define <word>' }, { quoted: quotedMsg }); break; } try { const r = await axios.get(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(argText)}`, { timeout: 10000 }); const d = r.data[0]; const def = d.meanings[0].definitions[0]; await sock.sendMessage(chatId, { text: `📖 *${argText}* (${d.meanings[0].partOfSpeech})\n\n${def.definition}` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '❌ Not found' }, { quoted: quotedMsg }); } break;
+        case `${prefix}shorten`: if (!args[0]) { await sock.sendMessage(chatId, { text: 'Usage: .shorten <url>' }, { quoted: quotedMsg }); break; } try { const r = await axios.get(`https://is.gd/create.php?format=simple&url=${encodeURIComponent(args[0])}`, { timeout: 10000 }); await sock.sendMessage(chatId, { text: `🔗 ${r.data}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        // TOOLS
+        case `${prefix}calc`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .calc <expr>' }, { quoted: quotedMsg }); break; } try { const s = argText.replace(/[^0-9+\-*/().%\s]/g, ''); if (!s) throw 0; const r = Function('"use strict";return(' + s + ')')(); await sock.sendMessage(chatId, { text: `🔢 ${argText} = *${r}*` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '❌ Invalid' }, { quoted: quotedMsg }); } break;
+        case `${prefix}qr`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .qr <text>' }, { quoted: quotedMsg }); break; } try { const r = await axios.get(`https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(argText)}`, { responseType: 'arraybuffer', timeout: 15000 }); await sock.sendMessage(chatId, { image: Buffer.from(r.data), caption: '📱 QR' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}uuid`: await sock.sendMessage(chatId, { text: `🆔 ${require('crypto').randomUUID()}` }, { quoted: quotedMsg }); break;
+        case `${prefix}pass`: { const len = parseInt(args[0])||12; const ch = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*'; let p = ''; for (let i=0; i<Math.min(len,50); i++) p += ch[Math.floor(Math.random()*ch.length)]; await sock.sendMessage(chatId, { text: `🔐 ${p}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}reverse`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .reverse <text>' }, { quoted: quotedMsg }); break; } await sock.sendMessage(chatId, { text: `🔄 ${argText.split('').reverse().join('')}` }, { quoted: quotedMsg }); break;
+        case `${prefix}count`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .count <text>' }, { quoted: quotedMsg }); break; } await sock.sendMessage(chatId, { text: `📊 Chars: ${argText.length}\nWords: ${argText.split(/\s+/).filter(w=>w).length}` }, { quoted: quotedMsg }); break;
+        case `${prefix}base64`: { const sub = args[0]?.toLowerCase(); const t = args.slice(1).join(' '); if (!sub || !t) { await sock.sendMessage(chatId, { text: 'Usage: .base64 encode <text>\n       .base64 decode <text>' }, { quoted: quotedMsg }); break; } try { const r = sub==='encode' ? Buffer.from(t).toString('base64') : Buffer.from(t, 'base64').toString('utf-8'); await sock.sendMessage(chatId, { text: `🔐 ${r}` }, { quoted: quotedMsg }); } catch { await sock.sendMessage(chatId, { text: '❌ Invalid' }, { quoted: quotedMsg }); } } break;
+        case `${prefix}hash`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .hash <text>' }, { quoted: quotedMsg }); break; } { const c = require('crypto'); await sock.sendMessage(chatId, { text: `#️⃣ MD5: ${c.createHash('md5').update(argText).digest('hex')}\nSHA256: ${c.createHash('sha256').update(argText).digest('hex')}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}fliptext`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .fliptext <text>' }, { quoted: quotedMsg }); break; } { const m2 = {'a':'ɐ','b':'q','c':'ɔ','d':'p','e':'ǝ','f':'ɟ','g':'ƃ','h':'ɥ','i':'ᴉ','j':'ɾ','k':'ʞ','l':'l','m':'ɯ','n':'u','o':'o','p':'d','q':'b','r':'ɹ','s':'s','t':'ʇ','u':'n','v':'ʌ','w':'ʍ','x':'x','y':'ʎ','z':'z'}; let r2=''; for (const ch of argText) r2 += m2[ch.toLowerCase()]||ch; await sock.sendMessage(chatId, { text: `🔄 ${r2.split('').reverse().join('')}` }, { quoted: quotedMsg }); } break;
+        // AI
+        case `${prefix}ai`: case `${prefix}ask`: if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .ai <question>' }, { quoted: quotedMsg }); break; } try { const key = getGeminiKey(); if (!key) { await sock.sendMessage(chatId, { text: '❌ Set .setgeminikey <key>' }, { quoted: quotedMsg }); break; } await sock.sendPresenceUpdate('composing', chatId); const res = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, { contents: [{ parts: [{ text: `You are Snuggle X. Reply concisely. User: ${argText}` }] }] }, { timeout: 30000, headers: { 'Content-Type': 'application/json' } }); const ai = res.data?.candidates?.[0]?.content?.parts?.[0]?.text; await sock.sendMessage(chatId, { text: ai?.trim() || '❌ No response' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}chatbot`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } if (argText === 'on') { dbSet('chatbot', '1'); await sock.sendMessage(chatId, { text: '✅ AI Chatbot ON — I will reply to DMs with conversation context' }, { quoted: quotedMsg }); } else if (argText === 'off') { dbSet('chatbot', '0'); await sock.sendMessage(chatId, { text: '❌ AI Chatbot OFF' }, { quoted: quotedMsg }); } else { await sock.sendMessage(chatId, { text: `*AI Chatbot:* ${dbGet('chatbot','0')==='1'?'ON ✅':'OFF ❌'}\n\nUsage: .chatbot on/off` }, { quoted: quotedMsg }); } break;
+        case `${prefix}setgeminikey`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setgeminikey <key>' }, { quoted: quotedMsg }); break; } dbSet('geminiKey', argText.trim()); await sock.sendMessage(chatId, { text: '✅ Key set' }, { quoted: quotedMsg }); break;
+        // OWNER
+        case `${prefix}setpp`: case `${prefix}setprofilepic`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } try { if (msg.imageMessage) { const buf = await downloadMediaMessage(m, 'buffer', {}, { logger: P({ level: 'silent' }) }); await sock.updateProfilePicture(sock.user.id, Buffer.from(buf)); await sock.sendMessage(chatId, { text: '✅ Profile pic updated' }, { quoted: quotedMsg }); } else { await sock.sendMessage(chatId, { text: 'Send image with caption .setpp' }, { quoted: quotedMsg }); } } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}setbio`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setbio <text>' }, { quoted: quotedMsg }); break; } try { await sock.updateProfileStatus(argText); await sock.sendMessage(chatId, { text: '✅ Bio updated' }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}setname`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } if (!argText) { await sock.sendMessage(chatId, { text: 'Usage: .setname <name>' }, { quoted: quotedMsg }); break; } try { await sock.updateProfileName(argText); await sock.sendMessage(chatId, { text: `✅ Name: ${argText}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}block`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const bt = args[0]?.replace(/[^0-9]/g, '') + '@s.whatsapp.net'; try { await sock.updateBlockStatus(bt, 'block'); await sock.sendMessage(chatId, { text: `✅ Blocked ${bt.split('@')[0]}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } } break;
+        case `${prefix}unblock`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const bt = args[0]?.replace(/[^0-9]/g, '') + '@s.whatsapp.net'; try { await sock.updateBlockStatus(bt, 'unblock'); await sock.sendMessage(chatId, { text: `✅ Unblocked ${bt.split('@')[0]}` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } } break;
+        case `${prefix}setmenuimage`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } try { if (msg.imageMessage) { const buf = await downloadMediaMessage(m, 'buffer', {}, { logger: P({ level: 'silent' }) }); fs.writeFileSync(path.join(getSessionDir(), 'menu-image.png'), Buffer.from(buf)); await sock.sendMessage(chatId, { text: '✅ Menu image set' }, { quoted: quotedMsg }); } else if (args[0]?.startsWith('http')) { const r = await axios.get(args[0], { responseType: 'arraybuffer', timeout: 30000 }); fs.writeFileSync(path.join(getSessionDir(), 'menu-image.png'), Buffer.from(r.data)); await sock.sendMessage(chatId, { text: '✅ Menu image set from URL' }, { quoted: quotedMsg }); } else { await sock.sendMessage(chatId, { text: 'Usage: .setmenuimage (send image with caption)\n.setmenuimage <url>' }, { quoted: quotedMsg }); } } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}setmenuvideo`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } try { if (msg.videoMessage) { const buf = await downloadMediaMessage(m, 'buffer', {}, { logger: P({ level: 'silent' }) }); fs.writeFileSync(path.join(getSessionDir(), 'menu-video.mp4'), Buffer.from(buf)); await sock.sendMessage(chatId, { text: '✅ Menu video set' }, { quoted: quotedMsg }); } else { await sock.sendMessage(chatId, { text: 'Send video with caption .setmenuvideo' }, { quoted: quotedMsg }); } } catch (e) { await sock.sendMessage(chatId, { text: `Failed: ${e.message}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}clearmenuvideo`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } try { fs.unlinkSync(path.join(getSessionDir(), 'menu-video.mp4')); } catch {} await sock.sendMessage(chatId, { text: '✅ Menu video cleared' }, { quoted: quotedMsg }); break;
+        case `${prefix}autofaketyping`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const on = argText === 'on'; dbSet('faketyping', on ? '1' : '0'); await sock.sendMessage(chatId, { text: `${on?'✅':'❌'} Auto fake typing ${on?'ON':'OFF'}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}autofakerecording`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const on = argText === 'on'; dbSet('fakerecording', on ? '1' : '0'); await sock.sendMessage(chatId, { text: `${on?'✅':'❌'} Auto fake recording ${on?'ON':'OFF'}` }, { quoted: quotedMsg }); } break;
+        case `${prefix}pair`: if (!ownerCheck) { await sock.sendMessage(chatId, { text: '> *only owner* 🚫' }, { quoted: quotedMsg }); break; } { const pn = args[0]?.replace(/[^0-9]/g, ''); if (!pn || pn.length < 10) { await sock.sendMessage(chatId, { text: 'Usage: .pair <number with country code>' }, { quoted: quotedMsg }); break; } await sock.sendMessage(chatId, { text: `⏳ Requesting pairing code for +${pn}...` }, { quoted: quotedMsg }); try { const { useMultiFileAuthState: ua, makeWASocket: ms, fetchLatestBaileysVersion: fv, makeCacheableSignalKeyStore: mk, Browsers: b } = require('@whiskeysockets/baileys'); const psd = path.join(getSessionDir(), 'pair-' + pn); fs.rmSync(psd, { recursive: true, force: true }); fs.mkdirSync(psd, { recursive: true }); const { state: ps, saveCreds: pc } = await ua(psd); const { version: pv } = await fv(); const pl = P({ level: 'silent' }); const psock = ms({ version: pv, auth: { creds: ps.creds, keys: mk(ps.keys, pl) }, printQRInTerminal: false, browser: b.ubuntu('Chrome'), logger: pl, markOnlineOnConnect: false }); let code = null; psock.ev.on('creds.update', pc); psock.ev.on('connection.update', async (u) => { if (u.qr && !code) { try { await new Promise(r=>setTimeout(r,1500)); code = await psock.requestPairingCode(pn); await sock.sendMessage(chatId, { text: `🔑 *Pairing Code:*\n\n*${code}*\n\nWhatsApp → Linked Devices → Link with phone number.` }, { quoted: quotedMsg }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } } if (u.connection === 'open') { setTimeout(() => { try { psock.end(); } catch {} fs.rmSync(psd, { recursive: true, force: true }); }, 5000); } }); } catch (e) { await sock.sendMessage(chatId, { text: `❌ ${e.message}` }, { quoted: quotedMsg }); } } break;
         default:
+          if (cmd.startsWith(prefix)) await sock.sendMessage(chatId, { text: `Unknown: ${cmd}\nType *${prefix}menu*` }, { quoted: quotedMsg });
           if (cmd.startsWith(prefix)) await sock.sendMessage(chatId, { text: `Unknown: ${cmd}\nType *${prefix}menu*` }, { quoted: quotedMsg });
       }
     } catch (e) { console.error('[MSG]', e.message); }
