@@ -1,0 +1,34 @@
+{
+  "name": "SnuggleX",
+  "description": "SnuggleX, your friendly WhatsApp assistant!",
+  "logo": "https://i.ibb.co/nqsRcKDB/Xploader4.jpg",
+  "keywords": [],
+  "repository": "https://github.com/yobbyking/snuggle-bot-fresh",
+  "stack": "heroku-24",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "env": {
+    "SESSION_ID": {
+      "description": "Must begin with 'yobbyx:~'. Get it from the pairing site.",
+      "value": "",
+      "required": true
+    },
+    "GEMINI_KEY": {
+      "description": "Google Gemini API key for AI commands (optional)",
+      "value": "",
+      "required": false
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/nodejs"
+    },
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-activestorage-preview"
+    },
+    {
+      "url": "https://github.com/clhuang/heroku-buildpack-webp-binaries.git"
+    }
+  ]
+}

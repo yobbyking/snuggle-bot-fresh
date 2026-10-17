@@ -1,20 +1,24 @@
 {
-  "name": "snuggle-x-bot",
+  "name": "SnuggleX",
   "version": "2.0.0",
-  "description": "Snuggle X WhatsApp Bot — deploy on Railway/Render with SESSION_ID env var",
+  "description": "The best Whatsapp bot",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
+  "engines": {
+    "node": ">=18 <25"
   },
+  "scripts": {
+    "start": "node index.js",
+    "stop": "pkill -f node",
+    "restart": "pkill -f node && npm start"
+  },
+  "author": "Yobby King",
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.24",
-    "pino": "^9.0.0",
-    "better-sqlite3": "^11.0.0",
     "axios": "^1.7.0",
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.0",
     "link-preview-js": "^3.0.0",
-    "express": "^4.21.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "pino": "^9.0.0"
   }
 }
