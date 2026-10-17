@@ -31,6 +31,8 @@ const {
 // CONFIG
 // ==========================================
 const SESSION_DIR = path.join(__dirname, 'session');
+let SESSION_DIR_OVERRIDE = null;
+function getSessionDir() { return SESSION_DIR_OVERRIDE || SESSION_DIR; }
 const CHANNEL_ID = '0029Vb9NwdJ8KMqo8fRJZu3R';
 const CHANNEL_JID = CHANNEL_ID + '@newsletter';
 const PAIRING_URL = process.env.PAIRING_URL || 'https://pair-snugglex.onrender.com';
@@ -81,9 +83,9 @@ async function decodeSession(sessionId) {
     let json;
     try { json = zlib.gunzipSync(gz).toString('utf-8'); } catch { json = Buffer.from(s, 'base64').toString('utf-8'); }
     const files = JSON.parse(json);
-    if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+    if (!fs.existsSync(getSessionDir())) fs.mkdirSync(getSessionDir(), { recursive: true });
     for (const [name, content] of Object.entries(files)) {
-      const fp = path.join(SESSION_DIR, name);
+      const fp = path.join(getSessionDir(), name);
       fs.mkdirSync(path.dirname(fp), { recursive: true });
       fs.writeFileSync(fp, Buffer.from(content, 'base64'));
     }
@@ -177,26 +179,35 @@ function buildMenu(prefix, ownerName, mode) {
 // MAIN
 // ==========================================
 async function start() {
-  // Decode session
-  const sessionId = process.env.SESSION_ID;
-  if (sessionId) {
-    await decodeSession(sessionId);
-  } else if (!fs.existsSync(path.join(SESSION_DIR, 'creds.json'))) {
-    console.error('❌ No SESSION_ID and no existing session. Set SESSION_ID env var.');
-    process.exit(1);
+  // Check for session folder argument (VPS mode: node index.js /path/to/session)
+  // OR SESSION_ID env var (Railway/Render mode: SESSION_ID=yobbyx:~xxx)
+  const sessionArg = process.argv[2];
+  if (sessionArg && fs.existsSync(path.join(sessionArg, 'creds.json'))) {
+    // VPS mode — use the session folder directly
+    SESSION_DIR_OVERRIDE = sessionArg;
+    console.log(`[Bot] Using session folder: ${sessionArg}`);
+  } else {
+    // Railway/Render mode — decode SESSION_ID
+    const sessionId = process.env.SESSION_ID;
+    if (sessionId) {
+      await decodeSession(sessionId);
+    } else if (!fs.existsSync(path.join(getSessionDir(), 'creds.json'))) {
+      console.error('❌ No SESSION_ID and no existing session. Set SESSION_ID env var.');
+      process.exit(1);
+    }
   }
 
   // Owner info
   let ownerJid = null, ownerName = 'Not Set!';
   try {
-    const creds = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, 'creds.json'), 'utf-8'));
+    const creds = JSON.parse(fs.readFileSync(path.join(getSessionDir(), 'creds.json'), 'utf-8'));
     if (creds.me?.id) { ownerJid = creds.me.id; ownerName = creds.me.name || 'Not Set!'; }
   } catch {}
   const ownerNumber = ownerJid ? ownerJid.split(':')[0].split('@')[0] : null;
   console.log(`[Bot] Owner: ${ownerNumber} (${ownerJid})`);
 
   // SQLite
-  const db = new Database(path.join(SESSION_DIR, 'bot.db'));
+  const db = new Database(path.join(getSessionDir(), 'bot.db'));
   db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT); CREATE TABLE IF NOT EXISTS sudos (number TEXT PRIMARY KEY);');
   const dbGet = (k, d) => { try { const r = db.prepare('SELECT value FROM kv WHERE key=?').get(k); return r ? r.value : d; } catch { return d; } };
   const dbSet = (k, v) => { try { db.prepare('INSERT OR REPLACE INTO kv (key,value) VALUES (?,?)').run(k, String(v)); } catch {} };
@@ -206,7 +217,7 @@ async function start() {
   const getGeminiKey = () => dbGet('geminiKey', '') || process.env.GEMINI_KEY || '';
 
   // Connect
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const { state, saveCreds } = await useMultiFileAuthState(getSessionDir());
   const { version } = await fetchLatestBaileysVersion();
   const logger = P({ level: 'warn' }, P.destination({ sync: false }));
   const sock = makeWASocket({
