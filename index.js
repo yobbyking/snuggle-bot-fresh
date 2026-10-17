@@ -259,7 +259,9 @@ async function start() {
     }
   });
 
-  // Messages
+  // Messages — KEY FIX from Klaus-Bot: process ALL messages including fromMe=true
+  // Don't skip fromMe=true. The owner's messages arrive as fromMe=true in DMs.
+  // Also: DON'T redirect LID DMs — keep the @lid JID, Baileys routes natively.
   sock.ev.on('messages.upsert', async ({ messages }) => {
     try {
       const m = messages[0];
@@ -270,8 +272,13 @@ async function start() {
       const participant = m.key.participant || chatId;
       const participantPn = m.key.participantPn || null;
       const isLid = chatId?.endsWith('@lid');
-      const isSelfChat = (chatId?.split('@')[0].split(':')[0] === ownerNumber) || (isLid && m.key.fromMe);
-      if (m.key.fromMe && !isSelfChat && !isGroup) return;
+
+      // Owner detection — match against phone number, LID, and fromMe
+      const senderPhone = (isGroup ? participant : chatId)?.split('@')[0].split(':')[0];
+      const isOwner = senderPhone === ownerNumber || (participantPn && participantPn.split('@')[0] === ownerNumber) || (isLid && !isGroup);
+      // DON'T skip fromMe=true — process ALL messages (owner commands come as fromMe=true)
+      // Only skip fromMe=true in non-owner DMs to prevent echo loops
+      if (m.key.fromMe && !isGroup && !isOwner) return;
 
       // Extract text
       const msg = m.message;
@@ -291,13 +298,8 @@ async function start() {
       const fakeContact = createFakeContact(ownerNumber, getOwnerName());
       const quotedMsg = isGroup ? (isMenuCmd ? m : fakeContact) : undefined;
 
-      // Owner check
-      const ownerCheck = (() => {
-        const ph = (isGroup ? participant : chatId)?.split('@')[0].split(':')[0];
-        if (ph === ownerNumber) return true;
-        if (participantPn && participantPn.split('@')[0] === ownerNumber) return true;
-        return isSelfChat || (isGroup && m.key.fromMe);
-      })();
+      // Owner check — use the isOwner variable computed above (covers phone, LID, fromMe)
+      const ownerCheck = isOwner || (isGroup && m.key.fromMe);
       const sudoCheck = (() => { try { return db.prepare('SELECT 1 FROM sudos WHERE number=?').get((isGroup ? participant : chatId)?.split('@')[0].split(':')[0]); } catch { return false; } })();
       const mode = getMode();
       if ((mode === 'silent' || mode === 'private') && !ownerCheck && !sudoCheck) return;
