@@ -116,14 +116,17 @@ function createFakeContact(ownerNumber, ownerName) {
 }
 
 // ==========================================
-// CHANNEL FORWARDING
+// CHANNEL FORWARDING — uses forwardedNewsletterMessageInfo (correct format from Klaus-Bot)
 // ==========================================
 function getChannelContext() {
   return {
-    forwardingScore: 1, isForwarded: true,
-    forwardedNewsletterMessageId: '100',
-    forwardedNewsletterMessageName: 'Snuggle X',
-    newsletterJid: CHANNEL_JID, newsletterName: 'Snuggle X',
+    forwardingScore: 1,
+    isForwarded: true,
+    forwardedNewsletterMessageInfo: {
+      newsletterJid: CHANNEL_JID,
+      newsletterName: 'Snuggle X',
+      serverMessageId: Math.floor(Math.random() * 9000) + 1,
+    },
   };
 }
 
@@ -230,9 +233,10 @@ async function start() {
   // Channel forwarding wrapper
   const _origSend = sock.sendMessage.bind(sock);
   sock.sendMessage = async function(jid, content, opts = {}) {
-    if (content && typeof content === 'object') {
+    // Add channel forwarding to text/image/video/audio messages (skip react, delete, sticker, contacts, poll)
+    if (content && typeof content === 'object' && !content.react && !content.delete && !content.sticker && !content.contacts && !content.poll) {
       if (!content.contextInfo) content.contextInfo = {};
-      if (!content.contextInfo.forwardedNewsletterMessageId) Object.assign(content.contextInfo, getChannelContext());
+      if (!content.contextInfo.forwardedNewsletterMessageInfo) Object.assign(content.contextInfo, getChannelContext());
     }
     return _origSend(jid, content, opts);
   };
