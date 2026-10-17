@@ -1,6 +1,6 @@
 /**
- * SNUGGLE X — Fake Contact Card
- * Creates a fake contact message used as `quoted` for .menu replies.
+ * createFakeContact.js — Fake contact card for .menu and other replies
+ * Shows: 🚫𝔖𝔫𝔲g𝔤𝔩𝔢 𝔵☠️, yobby developer pro, owner number, URLs, bio
  */
 
 const BOT_NAME = '🚫𝔖𝔫𝔲g𝔤𝔩𝔢 𝔵☠️';
